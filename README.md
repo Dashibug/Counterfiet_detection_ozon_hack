@@ -1,0 +1,2 @@
+Запустить train - PYTHONPATH=. python -u src/train.py
+Запустить predict - PYTHONPATH=. python src/predict.py
