@@ -1,0 +1,18 @@
+# created by virtualenv automatically
+# виртуальное окружение
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# IDE-шные файлы
+.idea/
+
+# данные и веса
+datasets/
+*.pt
+*.csv
+*.bin
+*.safetensors
+wandb/
+.env

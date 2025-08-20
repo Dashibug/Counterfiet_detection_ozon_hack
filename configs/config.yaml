@@ -1,0 +1,26 @@
+seed: 42
+
+data:
+  csv_path: "train_processed.csv"
+  images_root: datasets/ml_ozon_сounterfeit_train_images
+  img_size: 224
+  num_workers: 4
+
+model:
+  image_backbone: "yolov8n"
+  image_emb_dim: 1024
+  text_model: "DeepPavlov/rubert-base-cased"
+  text_max_len: 128
+  fusion_hidden: 512 # общий размер эмбеддингов
+
+train:
+  batch_size: 16
+  epochs: 10
+  lr: 0.0001
+  weight_decay: 0.0001
+  device: "cpu"
+
+wandb: #weight and biases - для трекинга экспериментов
+  use: true
+  project: "e-cup-2025"
+  entity: "your_wandb_account"
