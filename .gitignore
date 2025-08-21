@@ -16,3 +16,4 @@ datasets/
 *.safetensors
 wandb/
 .env
+.DS_Store
