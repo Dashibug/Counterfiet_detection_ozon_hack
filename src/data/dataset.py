@@ -48,10 +48,14 @@ class MultimodalDataset(Dataset):
         # if self.image_transform:
         #     image = self.image_transform(image)
         # --- IDs ---
-        item_id_for_image = int(row["ItemID"])
-        sample_id_for_submit = int(row["id"]) if "id" in self.df.columns else item_id_for_image
+        if "id" in self.df.columns:
+            id_submit = int(row["id"])
+        else:
+            id_submit = int(row.name)
 
-        img_path = self._resolve_image_path(row["ItemID"])
+        item_id = int(row["ItemID"])
+
+        img_path = self._resolve_image_path(item_id)
         has_image = 1.0 if img_path is not None else 0.0
         if img_path is not None:
             image = Image.open(img_path).convert("RGB")
@@ -93,7 +97,8 @@ class MultimodalDataset(Dataset):
         # --- LABEL ---
         #label = torch.tensor(row["resolution"], dtype=torch.float)
         out = {
-            "id": sample_id_for_submit,
+            "id": id_submit,
+            "item_id": item_id,
             "image": image,
             "text": toks,  # dict тензоров [L], без лишних unsqueeze
             "meta": meta

@@ -16,26 +16,49 @@ def collate_fn(batch):
     metas  = torch.stack([b["meta"]  for b in batch])
     keys   = batch[0]["text"].keys()
     toks   = {k: torch.stack([b["text"][k] for b in batch]) for k in keys}
-    ids    = [int(b["id"]) for b in batch]
-    out = {"image": images, "meta": metas, "text": toks, "id": ids}
+    ids = [int(b["id"]) for b in batch]  # <-- сабмит-id
+    item_ids = [int(b["item_id"]) for b in batch]
+    out = {"image": images, "meta": metas, "text": toks, "id": ids, "item_id": item_ids}
     if "label" in batch[0]:
         out["label"] = torch.stack([b["label"] for b in batch])
     return out
 
+# def save_submission(ids, probs, out_csv, test_csv, thr=0.5):
+#     preds = (np.asarray(probs) >= thr).astype(int)
+#     sub = pd.DataFrame({"id": np.asarray(ids, dtype=np.int64),
+#                         "prediction": preds.astype(np.int8)})
+#
+#     # проверки формата/полного покрытия
+#     assert sub["id"].is_unique, "id должны быть уникальны"
+#     assert set(sub["prediction"].unique()).issubset({0, 1})
+#     df_test = pd.read_csv(test_csv)
+#     order = df_test["ItemID"].astype(np.int64).values
+#     missing = set(order) - set(sub["id"])
+#     if missing:
+#         raise ValueError(f"В сабмите отсутствуют {len(missing)} id, напр. {list(missing)[:5]}")
+#
+#     sub = sub.set_index("id").loc[order].reset_index()
+#     sub.to_csv(out_csv, index=False)
+#     print(f"✅ Saved {out_csv} | rows={len(sub)} | pos_rate={sub['prediction'].mean():.4f}")
+#     return sub
 def save_submission(ids, probs, out_csv, test_csv, thr=0.5):
-    preds = (np.asarray(probs) >= thr).astype(int)
-    sub = pd.DataFrame({"id": np.asarray(ids, dtype=np.int64),
-                        "prediction": preds.astype(np.int8)})
+    ids = np.asarray(ids, dtype=np.int64)
+    probs = np.asarray(probs, dtype=float)
+    preds = (probs >= thr).astype(np.int8)
+    sub = pd.DataFrame({"id": ids, "prediction": preds})
 
-    # проверки формата/полного покрытия
+    # проверки формата/полного покрытия/типа
     assert sub["id"].is_unique, "id должны быть уникальны"
     assert set(sub["prediction"].unique()).issubset({0, 1})
     df_test = pd.read_csv(test_csv)
-    order = df_test["ItemID"].astype(np.int64).values
+    if "id" not in df_test.columns:
+        raise ValueError("В тестовом CSV нет столбца 'id' — он обязателен для сабмита.")
+    order = df_test["id"].astype(np.int64).values
     missing = set(order) - set(sub["id"])
     if missing:
-        raise ValueError(f"В сабмите отсутствуют {len(missing)} id, напр. {list(missing)[:5]}")
+        raise ValueError(f"В сабмите отсутствуют {len(missing)} id, напр. {list(sorted(missing))[:5]}")
 
+    # приводим к порядку из теста по 'id'
     sub = sub.set_index("id").loc[order].reset_index()
     sub.to_csv(out_csv, index=False)
     print(f"✅ Saved {out_csv} | rows={len(sub)} | pos_rate={sub['prediction'].mean():.4f}")
@@ -102,33 +125,29 @@ def main():
     print("Has 'id' col:", "id" in df.columns)
     print("Has 'ItemID' col:", "ItemID" in df.columns)
 
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Predicting"): #  забираем данные из батча
+            images = batch["image"].to(device) # Tensor [B,3,H,W]
+            meta = batch["meta"].to(device) # Tensor [B, num_meta]
+            toks = {k: v.to(device) for k, v in batch["text"].items()} # dict input_ids, attention_mask
+
+            img_emb = image_extractor(images) # эмбеббинги картинки
+            out = text_model(**toks, return_dict=True) # эмбеббинги текста
+            last_hidden = out.last_hidden_state # [B, L, 768]
+            attn = toks["attention_mask"].unsqueeze(-1).float() # [B, L, 1]
+            txt_emb = (last_hidden * attn).sum(1) / attn.sum(1) # [B, 768]
+
+            logits = clf(img_emb, txt_emb, meta) # объединяем модальности и считаем логиты
+            probs = torch.sigmoid(logits) # логит в метку
+            preds.extend(probs.detach().cpu().numpy().tolist()) # preds - список предсказаний для всех объектов теста.
+
+            ids.extend(batch["id"]) # список id (ключей для сабмита, не путать с ItemID, который нужен только для поиска картинок).
     # после инференса
     print("Pred rows:", len(ids))
     print("Unique pred ids:", len(set(ids)))
-
-    # проверка покрытия всех тестовых id
-    miss = set(df["id"].astype(int).tolist()) - set(map(int, ids))
-    print("Missing ids:", len(miss))
-    if len(miss) > 0:
-        print("Sample missing:", list(sorted(miss))[:10])
-    with torch.no_grad():
-        for batch in tqdm(loader, desc="Predicting"):
-            images = batch["image"].to(device)
-            meta = batch["meta"].to(device)
-            toks = {k: v.to(device) for k, v in batch["text"].items()}
-
-            img_emb = image_extractor(images)
-            out = text_model(**toks, return_dict=True)
-            last_hidden = out.last_hidden_state
-            attn = toks["attention_mask"].unsqueeze(-1).float()
-            txt_emb = (last_hidden * attn).sum(1) / attn.sum(1)
-
-            logits = clf(img_emb, txt_emb, meta)
-            probs = torch.sigmoid(logits)
-            labels = (probs >= 0.5).int().cpu().numpy()
-
-            preds.extend(labels.tolist())
-            ids.extend(batch["id"])
+    arr = np.asarray(preds, dtype=float)
+    print("probs min/mean/median/max:", arr.min(), arr.mean(), np.median(arr), arr.max())
+    print("share >= 0.5:", (arr >= 0.5).mean())
 
     save_submission(ids, preds, args.out_csv, args.test_csv, thr=0.5)
 
