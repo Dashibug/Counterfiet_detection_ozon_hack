@@ -51,7 +51,10 @@ class ImageEncoder(nn.Module):
         """
                 images: тензор [B, 3, H, W], уже прогнанный через self.transform
                 return: эмбеддинги [B, out_dim] (L2-нормированные, если normalize=True)
-                """
+        """
+        images = images.to(self.device)
+        if images.dtype != self.dtype:
+            images = images.to(self.dtype)
         feats = self.model.encode_image(images.to(self.device))
         if self.normalize:
             feats = torch.nn.functional.normalize(feats, dim=-1)
