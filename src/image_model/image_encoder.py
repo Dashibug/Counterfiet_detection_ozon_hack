@@ -40,12 +40,12 @@ class ImageEncoder(nn.Module):
         # open-clip хранит embed_dim на корневой модели, а у visual — output_dim
         self.out_dim = int(getattr(self.model, "embed_dim", getattr(self.model.visual, "output_dim")))
 
-        # фиксируем dtype, чтобы forward мог приводить входы
-        self.dtype = next(self.model.parameters()).dtype  # dtype модели после кастов
-        # если явно передан dtype — всё равно он совпадёт с параметрами
-
-        if dtype is not None:
-            self.model.to(dtype=dtype)
+        # # фиксируем dtype, чтобы forward мог приводить входы
+        # self.dtype = next(self.model.parameters()).dtype  # dtype модели после кастов
+        # # если явно передан dtype — всё равно он совпадёт с параметрами
+        #
+        # if dtype is not None:
+        #     self.model.to(dtype=dtype)
 
         # выключаем все градиенты
         for p in self.model.parameters():
@@ -58,8 +58,8 @@ class ImageEncoder(nn.Module):
                 return: эмбеддинги [B, out_dim] (L2-нормированные, если normalize=True)
         """
         images = images.to(self.device)
-        if images.dtype != self.dtype:
-            images = images.to(self.dtype)
+        # if images.dtype != self.dtype:
+        #     images = images.to(self.dtype)
         feats = self.model.encode_image(images.to(self.device))
         if self.normalize:
             feats = torch.nn.functional.normalize(feats, dim=-1)

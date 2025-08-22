@@ -62,14 +62,14 @@ def main(config_path="configs/config.yaml"):
     clip_model_name = cfg["model"].get("clip_model_name", "ViT-B-32")
     clip_pretrained = cfg["model"].get("openclip_pretrained", "laion2b_s34b_b79k")
     use_clip_text   = bool(cfg["model"].get("use_clip_text", False))
-    use_fp16 = (device == "cuda" and torch.cuda.is_available())
+    use_fp16 = False # надо пофиксить
 
     image_extractor = ImageEncoder(
         model_name=clip_model_name,
         pretrained=clip_pretrained,
         device=device,
-        normalize=True,
-        dtype=torch.float16 if use_fp16 else None,  # можно включить для ускорения на GPU
+        normalize=True
+        #dtype=torch.float16 if use_fp16 else None,  # можно включить для ускорения на GPU
     )
     img_tf = image_extractor.transform
     if use_clip_text:
