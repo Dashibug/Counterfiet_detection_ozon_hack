@@ -39,6 +39,11 @@ class ImageEncoder(nn.Module):
         # Размер эмбеддинга (у ViT-B/32 = 512, у L/14 = 768 и т.д.)
         # open-clip хранит embed_dim на корневой модели, а у visual — output_dim
         self.out_dim = int(getattr(self.model, "embed_dim", getattr(self.model.visual, "output_dim")))
+
+        # фиксируем dtype, чтобы forward мог приводить входы
+        self.dtype = next(self.model.parameters()).dtype  # dtype модели после кастов
+        # если явно передан dtype — всё равно он совпадёт с параметрами
+
         if dtype is not None:
             self.model.to(dtype=dtype)
 
