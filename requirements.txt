@@ -1,7 +1,6 @@
 torch>=1.12
 torchvision
 transformers
-ultralytics    # для YOLOv8
 timm
 albumentations
 pandas
@@ -15,3 +14,6 @@ opencv-python
 Pillow
 catboost>=1.2.5
 sentence-transformers>=3.0.0
+open-clip-torch>=2.24.0
+catboost>=1.2.5
+open-clip-torch>=2.24.0

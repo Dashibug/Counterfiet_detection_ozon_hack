@@ -1,8 +1,10 @@
-import yaml
+import yaml, json
 import random
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.model_selection import train_test_split
+from catboost import CatBoostClassifier, Pool
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from transformers import AutoTokenizer
@@ -14,6 +16,7 @@ from src.fusion.multimodal_classifier import MultimodalClassifier
 from src.utils.metrics import compute_metrics
 from tqdm import tqdm
 
+cb = None
 
 def seed_everything(seed=42):
     random.seed(seed)
@@ -26,121 +29,114 @@ def main(config_path="configs/config.yaml"):
     # --- CONFIG ---
     cfg = yaml.safe_load(open(config_path))
     seed_everything(cfg.get("seed", 42))
-
     device = cfg["train"]["device"]
 
     # --- DATA ---
     df = pd.read_csv(cfg["data"]["csv_path"])
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["text_model"])
 
-    numeric_cols = [c for c in df.columns if c.startswith("num_")]  # TODO: вынеси в конфиг
-    meta_dim = len(numeric_cols) + 1  # + has_image
+    numeric_cols = [c for c in df.columns if c.startswith("num_")]
+    #meta_dim = len(numeric_cols) + 1  # + has_image
 
-    img_tf = transforms.Compose([
-        transforms.Resize((cfg["data"]["img_size"], cfg["data"]["img_size"])),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                             std=[0.229, 0.224, 0.225]),
-    ])
+    # --- ENCODERS ---
+    # CLIP image encoder: берём правильный transform прямо из энкодера
+    clip_model_name = cfg["model"].get("clip_model_name", "ViT-B-32")
+    clip_pretrained = cfg["model"].get("openclip_pretrained", "laion2b_s34b_b79k")
 
-    dataset = MultimodalDataset(
-        df=df,
-        images_root=cfg["data"]["images_root"],
-        tokenizer=tokenizer,
-        numeric_cols=numeric_cols,
-        image_transform=img_tf,
-        text_max_len=cfg["model"]["text_max_len"],
-        add_has_image=True,
-    )
-    loader = DataLoader(dataset,
-                        batch_size=cfg["train"]["batch_size"],
-                        shuffle=True,
-                        num_workers=cfg["data"]["num_workers"],
-                        drop_last=True)
-
-    # --- MODELS ---
     image_extractor = ImageEncoder(
-        backbone="resnet50",
-        pretrained=True,
-        device=device
+        model_name=clip_model_name,
+        pretrained=clip_pretrained,
+        device=device,
+        normalize=True,
+        # dtype=torch.float16,  # можно включить для ускорения на GPU
     )
+    img_tf = image_extractor.transform
+
+    # RuBERT text encoder (как было)
     text_encoder = TextEncoder(
         model_name=cfg["model"]["text_model"],
         device=device
     )
-    clf = MultimodalClassifier(
-        image_dim=image_extractor.out_dim,
-        text_dim=768,
-        meta_dim=meta_dim,
-        hidden_size=cfg["model"]["fusion_hidden"]
-    ).to(device)
+    text_encoder.model.eval()
+    for p in text_encoder.model.parameters():
+        p.requires_grad_(False)
 
-    # --- OPTIM / LOSS ---
-    optimizer = torch.optim.AdamW(clf.parameters(),
-                                  lr=float(cfg["train"]["lr"]),
-                                  weight_decay=float(cfg["train"]["weight_decay"]))
-    criterion = torch.nn.BCEWithLogitsLoss()
+    # --- DATASET / LOADER ---
+    dataset = MultimodalDataset(
+        df=df,
+        images_root=cfg["data"]["images_root"],
+        tokenizer=tokenizer,  # нужен для токенов текста
+        numeric_cols=numeric_cols,
+        image_transform=img_tf,  # ВАЖНО: transform от CLIP
+        text_max_len=cfg["model"]["text_max_len"],
+        add_has_image=True,
+        label_col=cfg["data"].get("label_col", "resolution"),
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=False,  # для извлечения фич порядок не важен, но так удобнее для воспроизводимости
+        num_workers=cfg["data"]["num_workers"]
+    )
 
-    # --- TRAIN LOOP ---
-    best_auc = 0.0
+    # --- EXTRACT FEATURES (image + text + meta) ---
+    imgs, txts, metas, ys = [], [], [], []
+    with torch.no_grad():
+        for batch in tqdm(loader, desc="Extract features"):
+            images = batch["image"].to(device)
+            meta = batch["meta"].to(device)
 
-    try:
-        for epoch in range(cfg["train"]["epochs"]):
-            clf.train()
-            all_preds, all_labels = [], []
-            running_loss = 0.0
+            # CLIP image embeddings
+            img_emb = image_extractor(images)  # [B, D_img]
 
-            for step, batch in enumerate(tqdm(loader, desc=f"Epoch {epoch + 1}/{cfg['train']['epochs']}")):
-                images = batch["image"].to(device)
-                meta = batch["meta"].to(device)
-                labels = batch["label"].to(device)
+            # RuBERT mean-pooling
+            toks = {k: v.to(device) for k, v in batch["text"].items()}
+            out = text_encoder.model(**toks, return_dict=True)
+            last_hidden = out.last_hidden_state  # [B, L, 768]
+            attn = toks["attention_mask"].unsqueeze(-1).float()  # [B, L, 1]
+            txt_emb = (last_hidden * attn).sum(1) / attn.sum(1)  # [B, 768]
 
-                # эмбеддинги (замороженные энкодеры)
-                with torch.no_grad():
-                    image_emb = image_extractor(images)
-                    toks = {k: v.to(device) for k, v in batch["text"].items()}
-                    out = text_encoder.model(**toks, return_dict=True)
-                    last_hidden = out.last_hidden_state
-                    attn = toks["attention_mask"].unsqueeze(-1).float()
-                    text_emb = (last_hidden * attn).sum(1) / attn.sum(1)
+            imgs.append(img_emb.cpu().numpy())
+            txts.append(txt_emb.cpu().numpy())
+            metas.append(meta.cpu().numpy())
+            ys.append(batch["label"].cpu().numpy())
 
-                # шаг оптимизации
-                logits = clf(image_emb, text_emb, meta)
-                loss = criterion(logits, labels)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+    X_img = np.vstack(imgs).astype(np.float32)
+    X_txt = np.vstack(txts).astype(np.float32)
+    X_meta = np.vstack(metas).astype(np.float32) if metas else np.empty((len(df), 0), dtype=np.float32)
+    y = np.concatenate(ys).astype(np.int32)
 
-                # учёт лосса и метрик ПОСЛЕ каждого шага
-                running_loss += loss.item()
-                probs = torch.sigmoid(logits).detach().cpu().numpy()
-                all_preds.extend(probs)
-                all_labels.extend(labels.detach().cpu().numpy())
+    X = np.hstack([X_txt, X_img, X_meta]).astype(np.float32)
+    print("Shapes -> text:", X_txt.shape, "| image:", X_img.shape, "| meta:", X_meta.shape, "| X:", X.shape, "| y:",
+          y.shape)
 
-                # периодический лог
-                if (step + 1) % 50 == 0:
-                    avg = running_loss / 50.0
-                    print(f"[epoch {epoch + 1} step {step + 1}] loss={avg:.4f}", flush=True)
-                    running_loss = 0.0
+    # сохраним порядок numeric_cols для predict
+    json.dump(numeric_cols, open("numeric_cols.json", "w"))
 
-            # метрики за эпоху
-            metrics = compute_metrics(all_labels, all_preds)
-            print(f"Epoch {epoch + 1}/{cfg['train']['epochs']} "
-                  f"Loss(last)={loss.item():.4f} AUC={metrics['roc_auc']:.4f} F1={metrics['f1']:.4f}", flush=True)
+    # --- CATBOOST TRAIN ---
+    Xtr, Xva, ytr, yva = train_test_split(
+        X, y, test_size=0.2, random_state=cfg.get("seed", 42), stratify=y
+    )
+    params = dict(
+        iterations=cfg["catboost"]["iterations"],
+        learning_rate=cfg["catboost"]["learning_rate"],
+        depth=cfg["catboost"]["depth"],
+        l2_leaf_reg=cfg["catboost"]["l2_leaf_reg"],
+        eval_metric=cfg["catboost"]["eval_metric"],
+        loss_function=cfg["catboost"]["loss_function"],
+        early_stopping_rounds=cfg["catboost"]["early_stopping_rounds"],
+        random_seed=cfg.get("seed", 42),
+        task_type="GPU" if (cfg["catboost"]["use_gpu"] and torch.cuda.is_available()) else "CPU",
+        verbose=100,
+    )
+    cb = CatBoostClassifier(**params)
+    cb.fit(Pool(Xtr, ytr), eval_set=Pool(Xva, yva), use_best_model=True)
+    cb.save_model("cb_model.cbm")
+    va_probs = cb.predict_proba(Xva)[:, 1]
+    metrics = compute_metrics(yva, va_probs)
+    print(f"VAL  AUC={metrics['roc_auc']:.4f}  F1={metrics['f1']:.4f}")
 
-            # сохранение лучшего по AUC
-            if metrics['roc_auc'] > best_auc:
-                best_auc = metrics['roc_auc']
-                torch.save({
-                    "clf_state": clf.state_dict(),
-                    "best_auc": best_auc,
-                    "epoch": epoch + 1,
-                }, "ckpt_best.pt")
-                print(f"✔ Saved best checkpoint: AUC={best_auc:.4f}", flush=True)
-
-    except KeyboardInterrupt:
-        print("\n⛔️ Interrupted by user. Saving current checkpoint as ckpt_interrupt.pt")
-        torch.save({"clf_state": clf.state_dict()}, "ckpt_interrupt.pt")
+    print("✔ Saved: cb_model.cbm, numeric_cols.json")
 
 
 if __name__ == "__main__":

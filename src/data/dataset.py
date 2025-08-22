@@ -1,9 +1,14 @@
 """
     Мультимодальный датасет
+    Адаптирован под CLIP:
+    изображение всегда проходит через переданный image_transform (например, open-clip preprocess_val)
+    если картинки нет — создаётся чёрная заглушка и тоже пропускается через тот же transform
+    tokenizer опционален: если None, в выдаче text = {}
 """
 import torch
 import os
 from PIL import Image
+from typing import List, Optional, Dict, Any
 from torch.utils.data import Dataset
 from torchvision import transforms
 class MultimodalDataset(Dataset):
@@ -39,14 +44,15 @@ class MultimodalDataset(Dataset):
                 return p
         return None
 
+    def _load_image(self, path: Optional[str]) -> Image.Image:
+        if path is not None:
+            return Image.open(path).convert("RGB")
+        # чёрная заглушка (размер не важен — всё равно пройдёт через transform)
+        return Image.new("RGB", (224, 224), (0, 0, 0))
+
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
 
-        # --- IMAGE ---
-        # img_path = os.path.join(self.images_root, f"{row['ItemID']}.png")
-        # image = Image.open(img_path).convert("RGB")
-        # if self.image_transform:
-        #     image = self.image_transform(image)
         # --- IDs ---
         if "id" in self.df.columns:
             id_submit = int(row["id"])
@@ -55,21 +61,15 @@ class MultimodalDataset(Dataset):
 
         item_id = int(row["ItemID"])
 
+        # --- IMAGE ---
         img_path = self._resolve_image_path(item_id)
         has_image = 1.0 if img_path is not None else 0.0
-        if img_path is not None:
-            image = Image.open(img_path).convert("RGB")
-            if self.image_transform:
-                image = self.image_transform(image)
+        img = self._load_image(img_path)
+        if self.image_transform is not None:
+            image = self.image_transform(img)  # CLIP/timm валид-пайплайн
         else:
-            # заглушка того же размера, что обычное изображение
-            from torchvision.transforms import ToTensor, Resize
-            _tf = transforms.Compose([
-                Resize((224, 224)),
-                ToTensor(),
-                transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-            ])
-            image = _tf(Image.new("RGB", (224, 224), (0, 0, 0)))
+            # на всякий случай: приводим к тензору без нормализации
+            image = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0  # type: ignore
 
         # --- TEXT ---
         text_parts = [

@@ -7,38 +7,52 @@ import torch
 import torch.nn as nn
 from torchvision import transforms
 import timm
+import open_clip
+from typing import Optional
 
 class ImageEncoder(nn.Module):
-    def __init__(self, backbone="resnet50", pretrained=True, device='cuda'):
+    def __init__(
+        self,
+        model_name: str = "ViT-B-32",
+        pretrained: str = "laion2b_s34b_b79k",
+        device: str = "cuda",
+        normalize: bool = True,
+        dtype: Optional[torch.dtype] = None,  # можно передать torch.float16 для ускорения
+    ):
+        """
+        Args:
+            model_name: имя CLIP-архитектуры (напр. "ViT-B-32", "ViT-L-14", "ViT-B-16-plus-240")
+            pretrained: имя чекпойнта open-clip (напр. "laion2b_s34b_b79k", "openai", "datacomp_xl_s13b_b90k")
+            normalize: L2-нормализовать ли выходные эмбеддинги
+            dtype: принудительный dtype (напр. torch.float16). По умолчанию — как у модели.
+        """
         super().__init__()
-        # backbone без финального классификатора
-        self.model = timm.create_model(
-            backbone,
-            pretrained=pretrained,
-            num_classes=0  # выдаёт эмбеддинги вместо logits
-        ).to(device)
-        self.model.eval()
-        self.device = device
+        self.device = torch.device(device if (device == "cpu" or torch.cuda.is_available()) else "cpu")
+        self.normalize = normalize
 
-        # Регистрируем hook на предпоследний слой (neck)
-        #self.handle = self.model.model[-2].register_forward_hook(self._hook_fn)
+        # Модель + валид-трансформы от open-clip
+        model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+            model_name, pretrained=pretrained, device=self.device
+        )
+        self.model = model.eval()  # encode_image внутри модели
+        self.transform = preprocess_val  # корректный валид-трансформ
+        # Размер эмбеддинга (у ViT-B/32 = 512, у L/14 = 768 и т.д.)
+        # open-clip хранит embed_dim на корневой модели, а у visual — output_dim
+        self.out_dim = int(getattr(self.model, "embed_dim", getattr(self.model.visual, "output_dim")))
+        if dtype is not None:
+            self.model.to(dtype=dtype)
 
-        # Трансформ для подготовки изображения (как в resnet)
-        self.transform = transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            )
-        ])
+        # выключаем все градиенты
+        for p in self.model.parameters():
+            p.requires_grad_(False) # размер эмбеддинга
 
-        self.out_dim = self.model.num_features  # размер эмбеддинга
-
-    def forward(self, images: torch.Tensor):
+    @torch.inference_mode()
+    def forward(self, images: torch.Tensor) -> torch.Tensor:
         """
-        images: [B, 3, H, W], нормализованные изображения
-        → возвращает [B, out_dim]
-        """
-        with torch.no_grad():
-            return self.model(images)
+                images: тензор [B, 3, H, W], уже прогнанный через self.transform
+                return: эмбеддинги [B, out_dim] (L2-нормированные, если normalize=True)
+                """
+        feats = self.model.encode_image(images.to(self.device))
+        if self.normalize:
+            feats = torch.nn.functional.normalize(feats, dim=-1)
+        return feats
