@@ -13,3 +13,5 @@ hydra-core
 wandb
 opencv-python
 Pillow
+catboost>=1.2.5
+sentence-transformers>=3.0.0

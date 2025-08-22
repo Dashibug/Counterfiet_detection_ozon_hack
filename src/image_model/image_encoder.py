@@ -1,5 +1,5 @@
 """
-YOLOFeatureExtractor — модуль, который даёт image-embedding.
+ImageEncoder — модуль, который даёт image-embedding.
 
 """
 

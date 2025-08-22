@@ -7,6 +7,7 @@ from src.data.dataset import MultimodalDataset
 from src.fusion.multimodal_classifier import MultimodalClassifier
 from src.image_model.image_encoder import ImageEncoder
 from tqdm import tqdm
+import inspect
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -115,7 +116,10 @@ def main():
                                hidden_size=cfg["model"]["fusion_hidden"]).to(device)
 
     # загрузка весов
-    ckpt = torch.load(args.ckpt, map_location=device)
+    if "weights_only" in inspect.signature(torch.load).parameters:
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+    else:
+        ckpt = torch.load(args.ckpt, map_location=device)
     clf.load_state_dict(ckpt["clf_state"])
     clf.eval()
 
