@@ -7,11 +7,18 @@ data:
   num_workers: 4
 
 model:
+  use_clip_text: true
   clip_model_name: "ViT-B-32"
   openclip_pretrained: "laion2b_s34b_b79k"     # веса для open-clip
   image_emb_dim: 512
   text_model: "DeepPavlov/rubert-base-cased"
   text_max_len: 128
+
+features:
+  save_clip_npz: "clip_train_embeds.npz"
+  image_tta_flip: true      # усреднять эмбеды с hflip (False, чтобы выключить)
+  image_pca_dim: 128        # 0 — выключить PCA; иначе кол-во компонент
+  image_pca_whiten: false   # включить whitening (обычно false)
 
 train:
   batch_size: 64
@@ -23,13 +30,19 @@ train:
 catboost:
   iterations: 5000
   learning_rate: 0.05
-  depth: 6
+  depth: 8
   l2_leaf_reg: 3.0
   early_stopping_rounds: 200
   eval_metric: "AUC"
   loss_function: "Logloss"
   use_gpu: true
   threshold: 0.5
+
+catboost_tune:
+  use: true         # включить Optuna-тюнинг
+  trials: 20        # сколько тестов (10–30 норм)
+  cv_folds: 3       # k-fold для оценки
+  timeout: null     # либо число секунд, либо null
 
 wandb: #weight and biases - для трекинга экспериментов
   use: true

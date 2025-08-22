@@ -17,3 +17,4 @@ sentence-transformers>=3.0.0
 open-clip-torch>=2.24.0
 catboost>=1.2.5
 open-clip-torch>=2.24.0
+optuna

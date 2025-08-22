@@ -5,6 +5,11 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import open_clip
+from torchvision.transforms import functional as TF
+import torch.nn.functional as F
+import joblib
+
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -14,6 +19,17 @@ from catboost import CatBoostClassifier
 from src.data.dataset import MultimodalDataset
 from src.image_model.image_encoder import ImageEncoder   # CLIP
 from src.text_model.text_encoder import TextEncoder      # RuBERT
+
+def encode_image_with_tta(encoder, images, do_flip: bool):
+    emb = encoder(images)
+    if isinstance(emb, (tuple, list)):
+        emb = emb[0]
+    if do_flip:
+        emb2 = encoder(TF.hflip(images))
+        if isinstance(emb2, (tuple, list)):
+            emb2 = emb2[0]
+        emb = (emb + emb2) / 2
+    return emb
 
 
 def collate_fn(batch):
@@ -26,7 +42,8 @@ def collate_fn(batch):
     if "text" in batch[0] and batch[0]["text"]:
         keys = batch[0]["text"].keys()
         toks = {k: torch.stack([b["text"][k] for b in batch]) for k in keys}
-    out = {"image": images, "meta": metas, "text": toks, "id": ids, "item_id": item_ids}
+    texts_str = [b["text_str"] for b in batch] if "text_str" in batch[0] else None
+    out = {"image": images, "meta": metas, "text": toks, "text_str": texts_str, "id": ids, "item_id": item_ids}
     if "label" in batch[0]:
         out["label"] = torch.stack([b["label"] for b in batch])
     return out
@@ -78,6 +95,8 @@ def main():
     # CLIP (берём правильный preprocess из энкодера)
     clip_model_name = cfg["model"].get("clip_model_name", "ViT-B-32")
     clip_pretrained = cfg["model"].get("openclip_pretrained", "laion2b_s34b_b79k")
+    use_clip_text = bool(cfg["model"].get("use_clip_text", False))
+
     image_extractor = ImageEncoder(
         model_name=clip_model_name,
         pretrained=clip_pretrained,
@@ -94,6 +113,9 @@ def main():
     text_encoder.model.eval()
     for p in text_encoder.model.parameters():
         p.requires_grad_(False)
+
+    if use_clip_text:
+        clip_tokenizer = open_clip.get_tokenizer(clip_model_name)
 
     # --- DATASET / LOADER ---
     dataset = MultimodalDataset(
@@ -120,13 +142,18 @@ def main():
 
     # --- EXTRACT FEATURES ---
     ids, all_img, all_txt, all_meta = [], [], [], []
+    all_clip_txt = []  # если use_clip_text
     with torch.no_grad():
         for batch in tqdm(loader, desc="Extract features (image+text+meta)"):
             images = batch["image"].to(device)
             meta   = batch["meta"].to(device)
 
             # CLIP image embeddings
-            img_emb = image_extractor(images)  # [B, D_img]
+            do_flip = bool(cfg.get("features", {}).get("image_tta_flip", False))
+            img_emb = encode_image_with_tta(image_extractor, images, do_flip=do_flip)
+            if isinstance(img_emb, (tuple, list)):
+                img_emb = img_emb[0]
+            img_emb = img_emb.to(torch.float32)  # как в train.py # [B, D_img]
 
             # RuBERT mean-pooling
             toks = {k: v.to(device) for k, v in batch["text"].items()} if batch["text"] else {}
@@ -139,15 +166,39 @@ def main():
                 # на всякий случай, если токенов не будет
                 txt_emb = torch.zeros(images.size(0), 768, device=device)
 
+            # CLIP text embeddings (опц.)
+            if use_clip_text:
+                texts = batch.get("text_str", None)
+                if texts:
+                    clip_tok = clip_tokenizer(texts).to(device)
+                    clip_txt = image_extractor.model.encode_text(clip_tok)
+                    if isinstance(clip_txt, (tuple, list)):
+                        clip_txt = clip_txt[0]
+                    clip_txt = torch.nn.functional.normalize(clip_txt, dim=-1).to(torch.float32)
+                else:
+                    d = int(getattr(image_extractor.model, "text_embed_dim", 512))
+                    clip_txt = torch.zeros(images.size(0), d, device=device)
+
             all_img.append(img_emb.cpu().numpy())
             all_txt.append(txt_emb.cpu().numpy())
             all_meta.append(meta.cpu().numpy())
+            if use_clip_text:
+                all_clip_txt.append(clip_txt.cpu().numpy())
             ids.extend(batch["id"])
 
-    X_img  = np.vstack(all_img).astype(np.float32)
-    X_txt  = np.vstack(all_txt).astype(np.float32)
+    X_img = np.vstack(all_img).astype(np.float32)
+    if os.path.exists("pca_image.joblib"):
+        pca = joblib.load("pca_image.joblib")
+        X_img = pca.transform(X_img)
+        print(f"Applied PCA(image): -> {X_img.shape}")
+
+    X_txt = np.vstack(all_txt).astype(np.float32)  # RuBERT
     X_meta = np.vstack(all_meta).astype(np.float32) if all_meta else np.empty((len(df), 0), dtype=np.float32)
-    X = np.hstack([X_txt, X_img, X_meta]).astype(np.float32)
+    if use_clip_text:
+        X_clip_txt = np.vstack(all_clip_txt).astype(np.float32)
+        X = np.hstack([X_txt, X_clip_txt, X_img, X_meta]).astype(np.float32)
+    else:
+        X = np.hstack([X_txt, X_img, X_meta]).astype(np.float32)
 
     # --- PREDICT ---
     probs = cb.predict_proba(X)[:, 1]

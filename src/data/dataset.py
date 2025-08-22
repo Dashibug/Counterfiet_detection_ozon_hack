@@ -4,10 +4,12 @@
     изображение всегда проходит через переданный image_transform (например, open-clip preprocess_val)
     если картинки нет — создаётся чёрная заглушка и тоже пропускается через тот же transform
     tokenizer опционален: если None, в выдаче text = {}
+    дополнительно отдаём сырой текст 'text_str' для CLIP-text
 """
 import torch
 import os
 from PIL import Image
+import numpy as np
 from typing import List, Optional, Dict, Any
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -100,7 +102,8 @@ class MultimodalDataset(Dataset):
             "id": id_submit,
             "item_id": item_id,
             "image": image,
-            "text": toks,  # dict тензоров [L], без лишних unsqueeze
+            "text": toks,  # dict тензоров [L], без лишних unsqueeze rubert
+            "text_str": text,  # сырой текст для CLIP-text
             "meta": meta
         }
         if self.label_col is not None and self.label_col in self.df.columns:
