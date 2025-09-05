@@ -1,75 +1,77 @@
 # src/predict.py
-import os, argparse, yaml, torch, pandas as pd, numpy as np
+import os, argparse, yaml, json
+import numpy as np
+import pandas as pd
+import torch
 from torch.utils.data import DataLoader
-from torchvision import transforms
-from transformers import AutoTokenizer, AutoModel
-from src.data.dataset import MultimodalDataset
-from src.fusion.multimodal_classifier import MultimodalClassifier
-from src.image_model.image_encoder import ImageEncoder
 from tqdm import tqdm
-import inspect
+import open_clip
+from torchvision.transforms import functional as TF
+import torch.nn.functional as F
+import joblib
+
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+from transformers import AutoTokenizer
+from catboost import CatBoostClassifier
+
+from src.data.dataset import MultimodalDataset
+from src.image_model.image_encoder import ImageEncoder   # CLIP
+from src.text_model.text_encoder import TextEncoder      # RuBERT
+
+def encode_image_with_tta(encoder, images, do_flip: bool):
+    emb = encoder(images)
+    if isinstance(emb, (tuple, list)):
+        emb = emb[0]
+    if do_flip:
+        emb2 = encoder(TF.hflip(images))
+        if isinstance(emb2, (tuple, list)):
+            emb2 = emb2[0]
+        emb = (emb + emb2) / 2
+    return emb
+
+
 def collate_fn(batch):
     import torch
-    images = torch.stack([b["image"] for b in batch])
-    metas  = torch.stack([b["meta"]  for b in batch])
-    keys   = batch[0]["text"].keys()
-    toks   = {k: torch.stack([b["text"][k] for b in batch]) for k in keys}
-    ids = [int(b["id"]) for b in batch]  # <-- сабмит-id
+    images = torch.stack([b["image"] for b in batch])                       # [B,3,H,W]
+    metas  = torch.stack([b["meta"]  for b in batch]) if batch[0]["meta"].numel() else torch.empty(len(batch), 0)
+    ids    = [int(b["id"]) for b in batch]
     item_ids = [int(b["item_id"]) for b in batch]
-    out = {"image": images, "meta": metas, "text": toks, "id": ids, "item_id": item_ids}
+    toks = {}
+    if "text" in batch[0] and batch[0]["text"]:
+        keys = batch[0]["text"].keys()
+        toks = {k: torch.stack([b["text"][k] for b in batch]) for k in keys}
+    texts_str = [b["text_str"] for b in batch] if "text_str" in batch[0] else None
+    out = {"image": images, "meta": metas, "text": toks, "text_str": texts_str, "id": ids, "item_id": item_ids}
     if "label" in batch[0]:
         out["label"] = torch.stack([b["label"] for b in batch])
     return out
 
-# def save_submission(ids, probs, out_csv, test_csv, thr=0.5):
-#     preds = (np.asarray(probs) >= thr).astype(int)
-#     sub = pd.DataFrame({"id": np.asarray(ids, dtype=np.int64),
-#                         "prediction": preds.astype(np.int8)})
-#
-#     # проверки формата/полного покрытия
-#     assert sub["id"].is_unique, "id должны быть уникальны"
-#     assert set(sub["prediction"].unique()).issubset({0, 1})
-#     df_test = pd.read_csv(test_csv)
-#     order = df_test["ItemID"].astype(np.int64).values
-#     missing = set(order) - set(sub["id"])
-#     if missing:
-#         raise ValueError(f"В сабмите отсутствуют {len(missing)} id, напр. {list(missing)[:5]}")
-#
-#     sub = sub.set_index("id").loc[order].reset_index()
-#     sub.to_csv(out_csv, index=False)
-#     print(f"✅ Saved {out_csv} | rows={len(sub)} | pos_rate={sub['prediction'].mean():.4f}")
-#     return sub
+
 def save_submission(ids, probs, out_csv, test_csv, thr=0.5):
     ids = np.asarray(ids, dtype=np.int64)
     probs = np.asarray(probs, dtype=float)
     preds = (probs >= thr).astype(np.int8)
     sub = pd.DataFrame({"id": ids, "prediction": preds})
 
-    # проверки формата/полного покрытия/типа
-    assert sub["id"].is_unique, "id должны быть уникальны"
-    assert set(sub["prediction"].unique()).issubset({0, 1})
     df_test = pd.read_csv(test_csv)
     if "id" not in df_test.columns:
         raise ValueError("В тестовом CSV нет столбца 'id' — он обязателен для сабмита.")
     order = df_test["id"].astype(np.int64).values
-    missing = set(order) - set(sub["id"])
-    if missing:
-        raise ValueError(f"В сабмите отсутствуют {len(missing)} id, напр. {list(sorted(missing))[:5]}")
 
-    # приводим к порядку из теста по 'id'
+    # проверки
+    assert sub["id"].is_unique, "id должны быть уникальны"
+    assert set(sub["prediction"].unique()).issubset({0, 1})
+
     sub = sub.set_index("id").loc[order].reset_index()
     sub.to_csv(out_csv, index=False)
     print(f"✅ Saved {out_csv} | rows={len(sub)} | pos_rate={sub['prediction'].mean():.4f}")
-    return sub
+
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="configs/config.yaml")
-    ap.add_argument("--ckpt",   default="ckpt_interrupt.pt")
-    # если у тебя есть test_processed.csv — укажи его здесь:
+    ap.add_argument("--config",   default="configs/config.yaml")
     ap.add_argument("--test_csv", default="test_processed.csv")
     ap.add_argument("--out_csv",  default="submission.csv")
     args = ap.parse_args()
@@ -77,83 +79,134 @@ def main():
     cfg = yaml.safe_load(open(args.config))
     device = cfg["train"]["device"]
 
+    # --- DATAFRAME ---
     df = pd.read_csv(args.test_csv)
+
+    # --- numeric_cols порядок как в train ---
+    with open("numeric_cols.json") as f:
+        numeric_cols_train = json.load(f)
+    # создаём недостающие num_* в тесте
+    for c in numeric_cols_train:
+        if c not in df.columns:
+            df[c] = 0.0
+    numeric_cols = numeric_cols_train
+
+    # --- ENCODERS ---
+    # CLIP (берём правильный preprocess из энкодера)
+    clip_model_name = cfg["model"].get("clip_model_name", "ViT-B-32")
+    clip_pretrained = cfg["model"].get("openclip_pretrained", "laion2b_s34b_b79k")
+    use_clip_text = bool(cfg["model"].get("use_clip_text", False))
+
+    image_extractor = ImageEncoder(
+        model_name=clip_model_name,
+        pretrained=clip_pretrained,
+        device=device,
+        normalize=True,
+        # dtype=torch.float16,  # при желании ускорить на GPU
+    )
+    img_tf = image_extractor.transform
+    image_extractor.eval()
+
+    # RuBERT (как в train)
     tokenizer = AutoTokenizer.from_pretrained(cfg["model"]["text_model"])
+    text_encoder = TextEncoder(model_name=cfg["model"]["text_model"], device=device)
+    text_encoder.model.eval()
+    for p in text_encoder.model.parameters():
+        p.requires_grad_(False)
 
-    # numeric_cols должны совпадать с обучением (например, num_0..num_39)
-    numeric_cols = [c for c in df.columns if c.startswith("num_")]
-    meta_dim = len(numeric_cols) + 1
+    if use_clip_text:
+        clip_tokenizer = open_clip.get_tokenizer(clip_model_name)
 
-    img_tf = transforms.Compose([
-        transforms.Resize((cfg["data"]["img_size"], cfg["data"]["img_size"])),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485,0.456,0.406],[0.229,0.224,0.225]),
-    ])
-
+    # --- DATASET / LOADER ---
     dataset = MultimodalDataset(
         df=df,
         images_root=cfg["data"]["images_root"],
         tokenizer=tokenizer,
         numeric_cols=numeric_cols,
-        image_transform=img_tf,
+        image_transform=img_tf,                       # ВАЖНО: CLIP preprocess
         text_max_len=cfg["model"]["text_max_len"],
-        label_col=None,
-        add_has_image=True,
+        label_col=None,                               # тест без лейблов
+        add_has_image=True,                           # как в train
     )
-    loader = DataLoader(dataset,
-                        batch_size=cfg["train"]["batch_size"],
-                        shuffle=False,
-                        num_workers=cfg["data"]["num_workers"],
-                        collate_fn=collate_fn)
+    loader = DataLoader(
+        dataset,
+        batch_size=cfg["train"]["batch_size"],
+        shuffle=False,
+        num_workers=cfg["data"]["num_workers"],
+        collate_fn=collate_fn
+    )
 
-    # модели
-    image_extractor = ImageEncoder("resnet50", pretrained=True, device=device)
-    text_model = AutoModel.from_pretrained(cfg["model"]["text_model"]).to(device)
-    text_model.eval()
-    clf = MultimodalClassifier(image_dim=image_extractor.out_dim,
-                               text_dim=768,
-                               meta_dim=meta_dim,
-                               hidden_size=cfg["model"]["fusion_hidden"]).to(device)
+    # --- CatBoost ---
+    cb = CatBoostClassifier()
+    cb.load_model("cb_model.cbm")
 
-    # загрузка весов
-    if "weights_only" in inspect.signature(torch.load).parameters:
-        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
-    else:
-        ckpt = torch.load(args.ckpt, map_location=device)
-    clf.load_state_dict(ckpt["clf_state"])
-    clf.eval()
-
-    ids, preds = [], []
-    # после чтения df теста
-    print("Test rows:", len(df))
-    print("Has 'id' col:", "id" in df.columns)
-    print("Has 'ItemID' col:", "ItemID" in df.columns)
-
+    # --- EXTRACT FEATURES ---
+    ids, all_img, all_txt, all_meta = [], [], [], []
+    all_clip_txt = []  # если use_clip_text
     with torch.no_grad():
-        for batch in tqdm(loader, desc="Predicting"): #  забираем данные из батча
-            images = batch["image"].to(device) # Tensor [B,3,H,W]
-            meta = batch["meta"].to(device) # Tensor [B, num_meta]
-            toks = {k: v.to(device) for k, v in batch["text"].items()} # dict input_ids, attention_mask
+        for batch in tqdm(loader, desc="Extract features (image+text+meta)"):
+            images = batch["image"].to(device)
+            meta   = batch["meta"].to(device)
 
-            img_emb = image_extractor(images) # эмбеббинги картинки
-            out = text_model(**toks, return_dict=True) # эмбеббинги текста
-            last_hidden = out.last_hidden_state # [B, L, 768]
-            attn = toks["attention_mask"].unsqueeze(-1).float() # [B, L, 1]
-            txt_emb = (last_hidden * attn).sum(1) / attn.sum(1) # [B, 768]
+            # CLIP image embeddings
+            do_flip = bool(cfg.get("features", {}).get("image_tta_flip", False))
+            img_emb = encode_image_with_tta(image_extractor, images, do_flip=do_flip)
+            if isinstance(img_emb, (tuple, list)):
+                img_emb = img_emb[0]
+            img_emb = img_emb.to(torch.float32)  # как в train.py # [B, D_img]
 
-            logits = clf(img_emb, txt_emb, meta) # объединяем модальности и считаем логиты
-            probs = torch.sigmoid(logits) # логит в метку
-            preds.extend(probs.detach().cpu().numpy().tolist()) # preds - список предсказаний для всех объектов теста.
+            # RuBERT mean-pooling
+            toks = {k: v.to(device) for k, v in batch["text"].items()} if batch["text"] else {}
+            if toks:
+                out = text_encoder.model(**toks, return_dict=True)
+                last_hidden = out.last_hidden_state
+                attn = toks["attention_mask"].unsqueeze(-1).float()
+                txt_emb = (last_hidden * attn).sum(1) / attn.sum(1)  # [B, 768]
+            else:
+                # на всякий случай, если токенов не будет
+                txt_emb = torch.zeros(images.size(0), 768, device=device)
 
-            ids.extend(batch["id"]) # список id (ключей для сабмита, не путать с ItemID, который нужен только для поиска картинок).
-    # после инференса
-    print("Pred rows:", len(ids))
-    print("Unique pred ids:", len(set(ids)))
-    arr = np.asarray(preds, dtype=float)
-    print("probs min/mean/median/max:", arr.min(), arr.mean(), np.median(arr), arr.max())
-    print("share >= 0.5:", (arr >= 0.5).mean())
+            # CLIP text embeddings (опц.)
+            if use_clip_text:
+                texts = batch.get("text_str", None)
+                if texts:
+                    clip_tok = clip_tokenizer(texts).to(device)
+                    clip_txt = image_extractor.model.encode_text(clip_tok)
+                    if isinstance(clip_txt, (tuple, list)):
+                        clip_txt = clip_txt[0]
+                    clip_txt = torch.nn.functional.normalize(clip_txt, dim=-1).to(torch.float32)
+                else:
+                    d = int(getattr(image_extractor.model, "text_embed_dim", 512))
+                    clip_txt = torch.zeros(images.size(0), d, device=device)
 
-    save_submission(ids, preds, args.out_csv, args.test_csv, thr=0.5)
+            all_img.append(img_emb.cpu().numpy())
+            all_txt.append(txt_emb.cpu().numpy())
+            all_meta.append(meta.cpu().numpy())
+            if use_clip_text:
+                all_clip_txt.append(clip_txt.cpu().numpy())
+            ids.extend(batch["id"])
+
+    X_img = np.vstack(all_img).astype(np.float32)
+    if os.path.exists("pca_image.joblib"):
+        pca = joblib.load("pca_image.joblib")
+        X_img = pca.transform(X_img)
+        print(f"Applied PCA(image): -> {X_img.shape}")
+
+    X_txt = np.vstack(all_txt).astype(np.float32)  # RuBERT
+    X_meta = np.vstack(all_meta).astype(np.float32) if all_meta else np.empty((len(df), 0), dtype=np.float32)
+    if use_clip_text:
+        X_clip_txt = np.vstack(all_clip_txt).astype(np.float32)
+        X = np.hstack([X_txt, X_clip_txt, X_img, X_meta]).astype(np.float32)
+    else:
+        X = np.hstack([X_txt, X_img, X_meta]).astype(np.float32)
+
+    # --- PREDICT ---
+    probs = cb.predict_proba(X)[:, 1]
+    print("Rows:", len(ids), "| X:", X.shape, "| prob stats:",
+          float(probs.min()), float(probs.mean()), float(probs.max()))
+
+    save_submission(ids, probs, args.out_csv, args.test_csv, thr=float(cfg["catboost"]["threshold"]))
+
 
 if __name__ == "__main__":
     main()

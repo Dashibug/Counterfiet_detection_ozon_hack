@@ -3,24 +3,43 @@ seed: 42
 data:
   csv_path: "train_processed.csv"
   images_root: datasets/ml_ozon_сounterfeit_train_images
-  img_size: 224
+  #img_size: 224
   num_workers: 4
 
 model:
-  image_backbone: "resnet50"
-  image_emb_dim: 1024
+  use_clip_text: true
+  clip_model_name: "ViT-B-32"
+  openclip_pretrained: "laion2b_s34b_b79k"     # веса для open-clip
+  image_emb_dim: 512
   text_model: "DeepPavlov/rubert-base-cased"
   text_max_len: 128
-  fusion_hidden: 512 # общий размер эмбеддингов
+
+features:
+  save_clip_npz: "clip_train_embeds.npz"
+  image_tta_flip: true      # усреднять эмбеды с hflip
+  image_pca_dim: 128        # 0 — выключить PCA; иначе кол-во компонент
+  image_pca_whiten: false   # включить whitening (обычно false)
 
 train:
-  batch_size: 16
-  epochs: 10
-  lr: 0.0001
-  weight_decay: 0.0001
+  batch_size: 64
+  #epochs: 10
+  #lr: 0.0001
+  #weight_decay: 0.0001
   device: "cpu"
 
-wandb: #weight and biases - для трекинга экспериментов
-  use: true
-  project: "e-cup-2025"
-  entity: "your_wandb_account"
+catboost:
+  iterations: 5000
+  learning_rate: 0.05
+  depth: 8
+  l2_leaf_reg: 3.0
+  early_stopping_rounds: 200
+  eval_metric: "AUC"
+  loss_function: "Logloss"
+  use_gpu: true
+  threshold: 0.5
+
+catboost_tune:
+  use: true         # включить Optuna-тюнинг
+  trials: 20        # сколько тестов (10–30 норм)
+  cv_folds: 3       # k-fold для оценки
+  timeout: null     # либо число секунд, либо null
