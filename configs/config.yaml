@@ -16,7 +16,7 @@ model:
 
 features:
   save_clip_npz: "clip_train_embeds.npz"
-  image_tta_flip: true      # усреднять эмбеды с hflip (False, чтобы выключить)
+  image_tta_flip: true      # усреднять эмбеды с hflip
   image_pca_dim: 128        # 0 — выключить PCA; иначе кол-во компонент
   image_pca_whiten: false   # включить whitening (обычно false)
 
@@ -43,8 +43,3 @@ catboost_tune:
   trials: 20        # сколько тестов (10–30 норм)
   cv_folds: 3       # k-fold для оценки
   timeout: null     # либо число секунд, либо null
-
-wandb: #weight and biases - для трекинга экспериментов
-  use: true
-  project: "e-cup-2025"
-  entity: "your_wandb_account"

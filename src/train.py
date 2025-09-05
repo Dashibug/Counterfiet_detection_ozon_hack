@@ -69,7 +69,7 @@ def main(config_path="configs/config.yaml"):
         pretrained=clip_pretrained,
         device=device,
         normalize=True
-        #dtype=torch.float16 if use_fp16 else None,  # можно включить для ускорения на GPU
+        #dtype=torch.float16 if use_fp16 else None,
     )
     img_tf = image_extractor.transform
     if use_clip_text:
@@ -196,7 +196,7 @@ def main(config_path="configs/config.yaml"):
             id=ids_np,
             item_id=item_ids_np,
             img=X_img,  # [N, D_img] float32
-            label=y,  # [N] int32 — таргеты тренировки
+            label=y,  # [N] int32 — таргеты
         )
         print(f"💾 Saved CLIP embeddings: {save_clip_npz} | img shape={X_img.shape}")
     except Exception as e:
@@ -209,20 +209,17 @@ def main(config_path="configs/config.yaml"):
         # базовые неизменяемые параметры
         fixed = dict(**base_params)
 
-        # некоторые параметры лучше не тюнить через Optuna
-        # (eval_metric/loss_function/iterations/early_stopping/seed/task_type/verbose)
         def objective(trial):
             params = dict(
                 depth=trial.suggest_int("depth", 4, 10),
                 learning_rate=trial.suggest_float("learning_rate", 1e-2, 0.2, log=True),
                 l2_leaf_reg=trial.suggest_float("l2_leaf_reg", 1e-2, 10.0, log=True),
                 bagging_temperature=trial.suggest_float("bagging_temperature", 0.0, 1.0),
-                rsm=trial.suggest_float("rsm", 0.6, 1.0),  # subsample features
                 random_strength=trial.suggest_float("random_strength", 0.0, 5.0),
                 # попробуем и с авто-весами, и без
                 auto_class_weights=trial.suggest_categorical("auto_class_weights", [None, "Balanced"]),
             )
-            # на GPU grow_policy игнорируется (обливиус-деревья), поэтому не трогаем
+            # на GPU grow_policy игнорируется
             params = {k: v for k, v in params.items() if v is not None}
             params.update(fixed)
 
@@ -253,9 +250,7 @@ def main(config_path="configs/config.yaml"):
         best_thr, best_f1 = 0.5, -1.0
         for thr in grid:
             pred = (probs >= thr).astype(np.int8)
-            m = compute_metrics(y_true, probs)  # считаем F1 внутри? — лучше по preds:
-            # если твой compute_metrics требует probs, то F1 он сам посчитает по thr=0.5.
-            # Тогда считаем вручную:
+            m = compute_metrics(y_true, probs)
             tp = ((y_true == 1) & (pred == 1)).sum()
             fp = ((y_true == 0) & (pred == 1)).sum()
             fn = ((y_true == 1) & (pred == 0)).sum()
@@ -264,8 +259,7 @@ def main(config_path="configs/config.yaml"):
                 best_f1, best_thr = f1, float(thr)
         return best_thr, best_f1
 
-    # --- CATBOOST TRAIN ---
-    # --- CATBOOST TRAIN (+ Optuna) ---
+    # --- CATBOOST TRAIN + Optuna ---
     Xtr, Xva, ytr, yva = train_test_split(
         X, y, test_size=0.2, random_state=cfg.get("seed", 42), stratify=y
     )
@@ -281,9 +275,8 @@ def main(config_path="configs/config.yaml"):
         random_seed=cfg.get("seed", 42),
         task_type="GPU" if (cfg["catboost"]["use_gpu"] and torch.cuda.is_available()) else "CPU",
         verbose=False,
-        # полезные дефолты:
-        bootstrap_type="Bayesian",  # хорошо работает с bagging_temperature
-        od_type="Iter",  # стандартный early stop
+        bootstrap_type="Bayesian",
+        od_type="Iter"
     )
 
     tune_cfg = cfg.get("catboost_tune", {})
@@ -299,7 +292,7 @@ def main(config_path="configs/config.yaml"):
         best_params = base_params
 
     print("Final CatBoost params:", {k: best_params[k] for k in [
-        "depth", "learning_rate", "l2_leaf_reg", "bagging_temperature", "rsm", "random_strength", "auto_class_weights"
+        "depth", "learning_rate", "l2_leaf_reg", "bagging_temperature", "random_strength", "auto_class_weights"
     ] if k in best_params})
 
     cb = CatBoostClassifier(**best_params)

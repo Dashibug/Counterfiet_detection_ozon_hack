@@ -36,7 +36,6 @@ class TextEncoder(torch.nn.Module):
         with torch.no_grad():  # если не хотим fine-tune
             outputs = self.model(**toks)
 
-        # Попробуем mean pooling (обычно лучше, чем CLS/pooler)
         last_hidden = outputs.last_hidden_state  # [B, seq_len, hidden]
         attention_mask = toks["attention_mask"]  # [B, seq_len]
 

@@ -49,7 +49,6 @@ class MultimodalDataset(Dataset):
     def _load_image(self, path: Optional[str]) -> Image.Image:
         if path is not None:
             return Image.open(path).convert("RGB")
-        # чёрная заглушка (размер не важен — всё равно пройдёт через transform)
         return Image.new("RGB", (224, 224), (0, 0, 0))
 
     def __getitem__(self, idx):
@@ -78,7 +77,7 @@ class MultimodalDataset(Dataset):
             str(row.get('name_rus', '')),
             str(row.get('description', '')),
             str(row.get('brand_name', '')),
-            str(row.get('CommercialTypeName4', ''))# безопасно вытаскиваем название
+            str(row.get('CommercialTypeName4', ''))
         ]
         text = " ".join([part for part in text_parts if part != 'nan'])
         toks = self.tokenizer(
@@ -111,11 +110,11 @@ class MultimodalDataset(Dataset):
         return out
 
         # return {
-        #     "id": int(row["ItemID"]), # закомментируй для трейна
+        #     "id": int(row["ItemID"]),
         #     "image": image,
         #     "text": toks,
         #     "meta": meta,
-        #     #"label": label # закомментируй для трейна
+        #     #"label": label
         # }
 
 
